@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090912">
+  <title>PARADOX MUSIC — поиск музыки</title>
+  <style>
+    :root{color-scheme:dark;--bg:#090912;--panel:#141421;--muted:#a5a4b8;--purple:#8957ff;--line:#29263b}
+    *{box-sizing:border-box}
+    body{margin:0;background:radial-gradient(ellipse at 50% -15%,#34205f 0,transparent 42%),var(--bg);color:#f7f5ff;font-family:Inter,system-ui,Arial,sans-serif;min-height:100vh}
+    .wrap{width:min(960px,92%);margin:auto;padding:42px 0 70px}
+    header{text-align:center;margin:16px 0 34px}
+    .mark{width:62px;height:62px;border-radius:20px;margin:0 auto 15px;background:linear-gradient(135deg,#a477ff,#5424c7);display:grid;place-items:center;font-size:27px;box-shadow:0 12px 45px #7540df55}
+    h1{font-size:clamp(30px,7vw,48px);letter-spacing:3px;margin:0;font-weight:850}
+    .tag{color:#bdb2e7;letter-spacing:3px;font-size:11px;margin-top:9px}
+    .intro{color:var(--muted);text-align:center;margin:0 0 26px}
+    .panel{background:#11111dcc;border:1px solid var(--line);border-radius:24px;padding:clamp(18px,4vw,30px);box-shadow:0 22px 80px #0007}
+    .search{display:flex;gap:10px}
+    input[type=text]{min-width:0;flex:1;background:#090911;border:1px solid #37334c;border-radius:14px;padding:16px;color:white;font-size:16px;outline:none}
+    input:focus{border-color:var(--purple)}
+    button{border:0;border-radius:13px;padding:14px 19px;background:var(--purple);color:white;font-weight:750;font-size:14px;cursor:pointer}
+    button:disabled{opacity:.55;cursor:wait}
+    .tabs{display:flex;gap:9px;margin:17px 0 8px;flex-wrap:wrap}
+    .tabs button{background:#252238;color:#ded8f3}
+    .tabs button.active{background:#7547db;color:white}
+    .hint,.status{font-size:13px;color:var(--muted);margin-top:13px;line-height:1.5}
+    .upload{margin-top:17px;padding:17px;border:1px dashed #51466f;border-radius:16px;background:#171425}
+    input[type=file]{width:100%;color:#c8c2da;margin-top:10px}
+    .recordrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    .recordrow .secondary{background:#302a46}
+    #results{display:grid;gap:12px;margin-top:22px}
+    .track{display:flex;gap:14px;align-items:center;padding:12px;background:#191827;border:1px solid #302b43;border-radius:16px;min-width:0}
+    .track img{width:68px;height:68px;border-radius:11px;object-fit:cover;background:#29243a}
+    .meta{min-width:0;flex:1}.meta strong{display:block;overflow-wrap:anywhere}.meta span{display:block;color:var(--muted);font-size:13px;margin-top:5px}
+    .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}.actions a{font-size:12px;color:#cbbaff;text-decoration:none}
+    .resultbox{margin-top:20px;padding:18px;background:#211b35;border:1px solid #4b3a70;border-radius:16px;line-height:1.7}
+    .footer{text-align:center;color:#77738c;font-size:12px;margin-top:25px}
+    @media(max-width:580px){.wrap{padding-top:24px}.search{flex-direction:column}.search button{width:100%}.track{align-items:flex-start}.track img{width:58px;height:58px}.track .actions{gap:12px}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <div class="mark">♫</div>
+      <h1>PARADOX MUSIC</h1>
+      <div class="tag">YOUR MUSIC SEARCH ENGINE</div>
+    </header>
+    <p class="intro">Найди любимую музыку или узнай, какая песня играет.</p>
+    <section class="panel">
+      <form id="searchForm" class="search">
+        <input id="query" type="text" minlength="2" maxlength="120" placeholder="Название песни или исполнитель..." autocomplete="off" required>
+        <button id="searchBtn" type="submit">⌕ Найти музыку</button>
+      </form>
+      <div class="tabs">
+        <button class="active" type="button" id="searchTab">Поиск музыки</button>
+        <button type="button" id="recognizeTab">Распознать песню</button>
+      </div>
+      <div id="recognizeArea" class="upload" hidden>
+        <strong>🎧 Определи композицию через AudD</strong>
+        <div class="hint">Загрузи короткий аудиофрагмент. Максимальный размер — 18 МБ.</div>
+        <input id="audioFile" type="file" accept="audio/*">
+        <div class="recordrow">
+          <button id="recognizeBtn" type="button">Распознать аудио</button>
+          <button id="recordBtn" class="secondary" type="button">● Записать с микрофона</button>
+          <button id="stopBtn" class="secondary" type="button" hidden>Остановить запись</button>
+        </div>
+        <div class="hint">Для записи браузер попросит разрешение на микрофон. Запись работает при открытии сайта по HTTPS.</div>
+      </div>
+      <div id="status" class="status" role="status">Введи название песни или исполнителя.</div>
+      <div id="results"></div>
+    </section>
+    <div class="footer">PARADOX MUSIC · Music discovery</div>
+  </main>
+<script>
+const $ = id => document.getElementById(id);
+const statusEl = $("status");
+let recorder = null, chunks = [];
+
+function status(message){ statusEl.textContent = message; }
+function escapeText(value){ return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+$("searchTab").addEventListener("click", () => {
+  $("recognizeArea").hidden = true;
+  $("searchTab").classList.add("active"); $("recognizeTab").classList.remove("active");
+  status("Введи название песни или исполнителя.");
+});
+$("recognizeTab").addEventListener("click", () => {
+  $("recognizeArea").hidden = false;
+  $("recognizeTab").classList.add("active"); $("searchTab").classList.remove("active");
+  status("Выбери аудиофайл или запиши фрагмент.");
+});
+
+$("searchForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const q = $("query").value.trim();
+  if(q.length < 2) return;
+  $("searchBtn").disabled = true; $("results").innerHTML = "";
+  status("Ищу музыку…");
+  try {
+    const response = await fetch("/api/search?q=" + encodeURIComponent(q));
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.error || "Ошибка поиска");
+    if(!data.results.length){ status("Ничего не найдено. Попробуй другой запрос."); return; }
+    status("Найдено: " + data.results.length + ". Результаты поиска:");
+    $("results").innerHTML = data.results.map(track => `
+      <article class="track">
+        ${track.cover ? `<img src="${escapeText(track.cover)}" alt="">` : `<div class="mark">♫</div>`}
+        <div class="meta">
+          <strong>${escapeText(track.title)}</strong>
+          <span>${escapeText(track.artist)}${track.album ? " · " + escapeText(track.album) : ""}</span>
+          <div class="actions">
+            ${track.preview ? `<a href="${escapeText(track.preview)}" target="_blank" rel="noopener">▶ Фрагмент</a>` : ""}
+            ${track.url ? `<a href="${escapeText(track.url)}" target="_blank" rel="noopener">Открыть трек ↗</a>` : ""}
+          </div>
+        </div>
+      </article>`).join("");
+  } catch(err){ status(err.message || "Не удалось выполнить поиск."); }
+  finally{$("searchBtn").disabled = false;}
+});
+
+async function recognize(blob){
+  if(!blob || !blob.size){status("Сначала выбери аудиофайл или запиши фрагмент.");return;}
+  if(blob.size > 18*1024*1024){status("Файл больше 18 МБ.");return;}
+  $("recognizeBtn").disabled = true; status("Отправляю аудио в AudD…"); $("results").innerHTML="";
+  try{
+    const response = await fetch("/api/recognize",{method:"POST",headers:{"Content-Type":blob.type || "application/octet-stream"},body:blob});
+    const data = await response.json();
+    if(!response.ok) throw new Error(data.error || "Ошибка распознавания");
+    if(!data.found){status(data.message || "Песня не найдена.");return;}
+    const links = [
+      data.links?.appleMusic ? `<a href="${escapeText(data.links.appleMusic)}" target="_blank" rel="noopener">Apple Music ↗</a>` : "",
+      data.links?.spotify ? `<a href="${escapeText(data.links.spotify)}" target="_blank" rel="noopener">Spotify ↗</a>` : "",
+      data.links?.song ? `<a href="${escapeText(data.links.song)}" target="_blank" rel="noopener">Открыть ↗</a>` : ""
+    ].filter(Boolean).join(" · ");
+    $("results").innerHTML = `<div class="resultbox"><strong>✓ Музыка найдена</strong><br>🎵 ${escapeText(data.title)}<br>👤 ${escapeText(data.artist)}${data.album ? "<br>💿 " + escapeText(data.album) : ""}<div class="actions">${links}</div></div>`;
+    status("Результат распознавания AudD.");
+  }catch(err){status(err.message || "Не удалось распознать аудио.");}
+  finally{$("recognizeBtn").disabled=false;}
+}
+$("recognizeBtn").addEventListener("click",()=>recognize($("audioFile").files[0]));
+
+$("recordBtn").addEventListener("click",async()=>{
+  try{
+    if(!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Запись не поддерживается этим браузером.");
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    chunks=[];
+    const preferred = ["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(t=>MediaRecorder.isTypeSupported(t));
+    recorder = new MediaRecorder(stream, preferred ? {mimeType:preferred} : undefined);
+    recorder.ondataavailable = e => {if(e.data.size) chunks.push(e.data);};
+    recorder.onstop = async()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const blob = new Blob(chunks,{type:recorder.mimeType || "audio/webm"});
+      await recognize(blob);
+    };
+    recorder.start();
+    $("recordBtn").hidden=true; $("stopBtn").hidden=false;
+    status("Идёт запись. Запиши небольшой фрагмент музыки и нажми «Остановить запись».");
+  }catch(err){status(err.message || "Не удалось включить микрофон.");}
+});
+$("stopBtn").addEventListener("click",()=>{
+  if(recorder && recorder.state!=="inactive") recorder.stop();
+  $("recordBtn").hidden=false; $("stopBtn").hidden=true;
+});
+</script>
+</body>
+</html>
