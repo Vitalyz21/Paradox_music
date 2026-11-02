@@ -3,7 +3,7 @@ require("dotenv").config();
 const { Bot, InputFile } = require("grammy");
 const fs = require("node:fs");
 const path = require("node:path");
-const os = require("node:os");
+const http = require("node:http");
 const { spawn } = require("node:child_process");
 const ffmpegPath = require("ffmpeg-static");
 
@@ -12,14 +12,17 @@ const AUDD_TOKEN = process.env.AUDD_TOKEN;
 const BOT_NAME = process.env.BOT_NAME || "PARADOX MUSIC";
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 18);
 const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = "0.0.0.0";
+const PUBLIC_DIR = path.join(__dirname, "public");
+const catalogPath = path.join(__dirname, "catalog.json");
 
 if (!BOT_TOKEN) {
-  console.error("Missing BOT_TOKEN. Copy .env.example to .env and add your Telegram bot token.");
+  console.error("Missing BOT_TOKEN. Add it to the Render environment variables.");
   process.exit(1);
 }
 
 const bot = new Bot(BOT_TOKEN);
-const catalogPath = path.join(__dirname, "catalog.json");
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"]/g, ch => ({
@@ -60,7 +63,7 @@ async function searchLyricsPhrase(query) {
   const url = new URL("https://lrclib.net/api/search");
   url.searchParams.set("q", query);
   const response = await fetch(url, {
-    headers: { "User-Agent": "ParadoxMusicBot/1.0 (Telegram bot)" }
+    headers: { "User-Agent": "ParadoxMusic/1.0" }
   });
   if (!response.ok) throw new Error("Lyrics search service is unavailable.");
   const data = await response.json();
@@ -72,42 +75,260 @@ function catalogMatch(query) {
   if (!q) return null;
   return loadCatalog().find(track => {
     const haystack = normalize(`${track.title || ""} ${track.artist || ""}`);
-    return haystack.includes(q) || q.includes(haystack);
+    return haystack && (haystack.includes(q) || q.includes(haystack));
   }) || null;
+}
+
+function mergeSearchResults(itunes, lyricMatches) {
+  const combined = [
+    ...itunes.map(track => ({
+      title: track.trackName || "Без названия",
+      artist: track.artistName || "Неизвестный исполнитель",
+      album: track.collectionName || "",
+      cover: track.artworkUrl100 || track.artworkUrl60 || "",
+      preview: track.previewUrl || "",
+      url: track.trackViewUrl || ""
+    })),
+    ...lyricMatches.map(track => ({
+      title: track.trackName || "Без названия",
+      artist: track.artistName || "Неизвестный исполнитель",
+      album: track.albumName || "",
+      cover: "",
+      preview: "",
+      url: track.url || ""
+    }))
+  ];
+
+  const seen = new Set();
+  return combined.filter(track => {
+    const key = normalize(`${track.title} ${track.artist}`);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 6);
+}
+
+async function searchMusic(query) {
+  const [itunesResult, lyricResult] = await Promise.allSettled([
+    searchItunes(query),
+    searchLyricsPhrase(query)
+  ]);
+  const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : [];
+  const lyrics = lyricResult.status === "fulfilled" ? lyricResult.value : [];
+  const results = mergeSearchResults(itunes, lyrics);
+
+  if (!results.length && itunesResult.status === "rejected" && lyricResult.status === "rejected") {
+    throw new Error("Сервисы поиска музыки временно недоступны.");
+  }
+  return results;
+}
+
+async function readRequestBody(req, maxBytes = MAX_FILE_BYTES) {
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      const err = new Error(`Файл слишком большой. Максимум: ${MAX_FILE_MB} МБ.`);
+      err.statusCode = 413;
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function extractMp3(inputBuffer) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-hide_banner", "-loglevel", "error",
+      "-i", "pipe:0",
+      "-vn", "-ac", "1", "-ar", "44100",
+      "-t", "90", "-f", "mp3", "pipe:1"
+    ];
+    const proc = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks = [];
+    let stderr = "";
+
+    proc.stdout.on("data", chunk => chunks.push(chunk));
+    proc.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    proc.on("error", reject);
+    proc.on("close", code => {
+      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
+      else reject(new Error(stderr || "Audio conversion failed."));
+    });
+    proc.stdin.end(inputBuffer);
+  });
+}
+
+async function recognizeAudio(buffer) {
+  if (!AUDD_TOKEN) {
+    const err = new Error("Распознавание не настроено: добавь AUDD_TOKEN в переменные окружения Render.");
+    err.statusCode = 503;
+    throw err;
+  }
+
+  const form = new FormData();
+  form.append("api_token", AUDD_TOKEN);
+  form.append("return", "apple_music,spotify");
+  form.append("file", new Blob([buffer], { type: "audio/mpeg" }), "audio.mp3");
+
+  const response = await fetch("https://api.audd.io/", {
+    method: "POST",
+    body: form
+  });
+  if (!response.ok) throw new Error("Сервис распознавания AudD временно недоступен.");
+
+  const payload = await response.json();
+  if (payload.status !== "success") {
+    throw new Error(payload.error?.error_message || "AudD не смог обработать аудио.");
+  }
+  return payload.result || null;
+}
+
+function sendJson(res, statusCode, data) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  });
+  res.end(JSON.stringify(data));
+}
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".webp": "image/webp"
+};
+
+async function handleRequest(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    return sendJson(res, 200, { ok: true, service: "PARADOX MUSIC" });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/search") {
+    const query = (url.searchParams.get("q") || "").trim();
+    if (query.length < 2 || query.length > 120) {
+      return sendJson(res, 400, { error: "Запрос должен содержать от 2 до 120 символов." });
+    }
+    try {
+      const results = await searchMusic(query);
+      return sendJson(res, 200, { results });
+    } catch (err) {
+      console.error("Web search error:", err);
+      return sendJson(res, 502, { error: err.message || "Ошибка поиска музыки." });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/recognize") {
+    try {
+      const input = await readRequestBody(req);
+      if (!input.length) return sendJson(res, 400, { error: "Аудиофайл пуст." });
+
+      const mp3 = await extractMp3(input);
+      const result = await recognizeAudio(mp3);
+      if (!result) {
+        return sendJson(res, 200, {
+          found: false,
+          message: "Не удалось определить песню. Попробуй более чёткий фрагмент."
+        });
+      }
+
+      return sendJson(res, 200, {
+        found: true,
+        title: result.title || "Неизвестный трек",
+        artist: result.artist || "Неизвестный исполнитель",
+        album: result.album || "",
+        links: {
+          appleMusic: result.apple_music?.url || "",
+          spotify: result.spotify?.external_urls?.spotify || "",
+          song: result.song_link || ""
+        }
+      });
+    } catch (err) {
+      console.error("Web recognition error:", err);
+      return sendJson(res, err.statusCode || 502, {
+        error: err.message || "Не удалось распознать аудио."
+      });
+    }
+  }
+
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    return sendJson(res, 405, { error: "Method not allowed." });
+  }
+
+  let pathname;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return sendJson(res, 400, { error: "Invalid URL." });
+  }
+
+  const requestedPath = pathname === "/" ? "/index.html" : pathname;
+  const filePath = path.resolve(PUBLIC_DIR, `.${requestedPath}`);
+  if (!filePath.startsWith(PUBLIC_DIR + path.sep) && filePath !== path.join(PUBLIC_DIR, "index.html")) {
+    return sendJson(res, 403, { error: "Forbidden." });
+  }
+
+  fs.stat(filePath, (err, stat) => {
+    if (err || !stat.isFile()) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      return res.end("Not found");
+    }
+    const contentType = MIME_TYPES[path.extname(filePath).toLowerCase()] || "application/octet-stream";
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "X-Content-Type-Options": "nosniff"
+    });
+    if (req.method === "HEAD") return res.end();
+    fs.createReadStream(filePath).pipe(res);
+  });
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(err => {
+    console.error("HTTP server error:", err);
+    if (!res.headersSent) sendJson(res, 500, { error: "Внутренняя ошибка сервера." });
+    else res.destroy();
+  });
+});
+
+async function downloadTelegramFile(fileId) {
+  const file = await bot.api.getFile(fileId);
+  if (!file.file_path) throw new Error("Telegram file path is missing.");
+  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("Could not download the Telegram attachment.");
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > MAX_FILE_BYTES) {
+    throw new Error(`Файл слишком большой. Максимум: ${MAX_FILE_MB} МБ.`);
+  }
+  return buffer;
 }
 
 async function sendTrackResults(ctx, query) {
   await ctx.reply("🔎 Ищу музыку…");
   try {
-    const [itunesResult, lyricResult] = await Promise.allSettled([
-      searchItunes(query),
-      searchLyricsPhrase(query)
-    ]);
-    const itunes = itunesResult.status === "fulfilled" ? itunesResult.value : [];
-    const lyricMatches = lyricResult.status === "fulfilled" ? lyricResult.value : [];
-    const combined = [...itunes, ...lyricMatches];
-    const seen = new Set();
-    const results = combined.filter(track => {
-      const key = normalize(`${track.trackName || track.name || ""} ${track.artistName || track.artist || ""}`);
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
+    const results = await searchMusic(query);
     if (!results.length) {
       return ctx.reply("Ничего не найдено. Попробуй другое название или отправь аудиофрагмент.");
     }
 
-    const lines = results.slice(0, 6).map((track, index) => {
-      const title = track.trackName || track.name || "Без названия";
-      const artist = track.artistName || track.artist || "Неизвестный исполнитель";
-      const album = track.collectionName || track.albumName;
-      const preview = track.previewUrl;
-      const link = track.trackViewUrl || track.url || track.externalUrl;
-      let line = `${index + 1}. <b>${escapeHtml(title)}</b> — ${escapeHtml(artist)}`;
-      if (album) line += `\n   <i>${escapeHtml(album)}</i>`;
-      if (preview) line += `\n   <a href="${escapeHtml(preview)}">Прослушать фрагмент</a>`;
-      if (link) line += ` · <a href="${escapeHtml(link)}">Открыть</a>`;
+    const lines = results.map((track, index) => {
+      let line = `${index + 1}. <b>${escapeHtml(track.title)}</b> — ${escapeHtml(track.artist)}`;
+      if (track.album) line += `\n   <i>${escapeHtml(track.album)}</i>`;
+      if (track.preview) line += `\n   <a href="${escapeHtml(track.preview)}">Прослушать фрагмент</a>`;
+      if (track.url) line += ` · <a href="${escapeHtml(track.url)}">Открыть</a>`;
       return line;
     });
 
@@ -134,60 +355,6 @@ async function sendTrackResults(ctx, query) {
   }
 }
 
-async function downloadTelegramFile(fileId) {
-  const file = await bot.api.getFile(fileId);
-  if (!file.file_path) throw new Error("Telegram file path is missing.");
-  const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Could not download the Telegram attachment.");
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_FILE_BYTES) {
-    throw new Error(`Файл слишком большой. Максимум: ${MAX_FILE_MB} МБ.`);
-  }
-  return buffer;
-}
-
-function extractMp3(inputBuffer) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-vn", "-ac", "1", "-ar", "44100",
-      "-t", "90", "-f", "mp3", "pipe:1"
-    ];
-    const proc = spawn(ffmpegPath, args, { stdio: ["pipe", "pipe", "pipe"] });
-    const chunks = [];
-    let stderr = "";
-    proc.stdout.on("data", chunk => chunks.push(chunk));
-    proc.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    proc.on("error", reject);
-    proc.on("close", code => {
-      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
-      else reject(new Error(stderr || "Audio conversion failed."));
-    });
-    proc.stdin.end(inputBuffer);
-  });
-}
-
-async function recognizeAudio(buffer) {
-  if (!AUDD_TOKEN) {
-    throw new Error("Распознавание аудио ещё не настроено: добавь AUDD_TOKEN в переменные окружения.");
-  }
-  const form = new FormData();
-  form.append("api_token", AUDD_TOKEN);
-  form.append("return", "apple_music,spotify");
-  form.append("file", new Blob([buffer], { type: "audio/mpeg" }), "audio.mp3");
-
-  const response = await fetch("https://api.audd.io/", {
-    method: "POST",
-    body: form
-  });
-  if (!response.ok) throw new Error("Recognition service is unavailable.");
-  const payload = await response.json();
-  if (payload.status !== "success" || !payload.result) return null;
-  return payload.result;
-}
-
 async function processMedia(ctx, fileId) {
   await ctx.reply("🎧 Слушаю фрагмент и пытаюсь определить трек…");
   try {
@@ -203,8 +370,8 @@ async function processMedia(ctx, fileId) {
     const artist = result.artist || "Неизвестный исполнитель";
     const album = result.album ? `\n💿 Альбом: ${escapeHtml(result.album)}` : "";
     const links = [];
-    const apple = result.apple_music && result.apple_music.url;
-    const spotify = result.spotify && result.spotify.external_urls && result.spotify.external_urls.spotify;
+    const apple = result.apple_music?.url;
+    const spotify = result.spotify?.external_urls?.spotify;
     if (apple) links.push(`<a href="${escapeHtml(apple)}">Apple Music</a>`);
     if (spotify) links.push(`<a href="${escapeHtml(spotify)}">Spotify</a>`);
     if (result.song_link) links.push(`<a href="${escapeHtml(result.song_link)}">Открыть трек</a>`);
@@ -269,9 +436,23 @@ bot.catch(err => {
   console.error("Bot error:", err);
 });
 
-bot.start({
-  onStart: info => console.log(`${BOT_NAME} started as @${info.username}`)
+server.listen(PORT, HOST, () => {
+  console.log(`PARADOX MUSIC web server listening on ${HOST}:${PORT}`);
 });
 
-process.once("SIGINT", () => bot.stop());
-process.once("SIGTERM", () => bot.stop());
+bot.start({
+  onStart: info => console.log(`${BOT_NAME} started as @${info.username}`)
+}).catch(err => {
+  console.error("Telegram bot failed to start:", err);
+  process.exitCode = 1;
+});
+
+async function shutdown(signal) {
+  console.log(`${signal} received; shutting down...`);
+  try { await bot.stop(); } catch (err) { console.error("Bot shutdown error:", err); }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000).unref();
+}
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));
